@@ -1,0 +1,23 @@
+{
+  "slug": "NTRWabot",
+  "name": "Nevertrustrobots",
+  "version": "2.9.0",
+  "license": "proprietary",
+  "brand": "Nevertrustrobots",
+  "author": "nevertrustrobots",
+  "authorEmail": "",
+  "authorUrl": "",
+  "pluginUrl": "",
+  "manualUrl": "",
+  "sourceUrl": "",
+  "donateUrl": "",
+  "changelogUrl": "",
+  "modules": [
+    {
+      "slug": "Wabot",
+      "name": "Nevertrustrobots Wabot",
+      "description": "Wabot server for Claude AI integration",
+      "tags": ["Utility", "External"]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+build/
+dep/
+dist/
+plugin.dylib
+plugin.dll
+plugin.so
+*.o
+*.d
+*.vcvplugin
