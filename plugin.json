@@ -1,22 +1,22 @@
 {
   "slug": "NTRWabot",
   "name": "Nevertrustrobots",
-  "version": "2.9.0",
-  "license": "proprietary",
+  "version": "2.9.6",
+  "license": "GPL-3.0-only",
   "brand": "Nevertrustrobots",
   "author": "nevertrustrobots",
   "authorEmail": "",
-  "authorUrl": "",
-  "pluginUrl": "",
-  "manualUrl": "",
-  "sourceUrl": "",
-  "donateUrl": "",
-  "changelogUrl": "",
+  "authorUrl": "https://www.patreon.com/c/nevertrustrobots",
+  "pluginUrl": "https://github.com/nevertrustrobots/NTRWabot",
+  "manualUrl": "https://github.com/nevertrustrobots/NTRWabot#readme",
+  "sourceUrl": "https://github.com/nevertrustrobots/NTRWabot",
+  "donateUrl": "https://www.patreon.com/c/nevertrustrobots",
+  "changelogUrl": "https://github.com/nevertrustrobots/NTRWabot/releases",
   "modules": [
     {
       "slug": "Wabot",
       "name": "Nevertrustrobots Wabot",
-      "description": "Wabot server for Claude AI integration",
+      "description": "HTTP bridge that lets Claude AI read and control your VCV Rack patch in real time. Connect it to Claude using the MCP Server + Skill available at https://www.patreon.com/c/nevertrustrobots",
       "tags": ["Utility", "External"]
     }
   ]

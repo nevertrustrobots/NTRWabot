@@ -24,4 +24,11 @@ CFLAGS   +=
 CXXFLAGS +=
 LDFLAGS  +=
 
+include $(RACK_DIR)/arch.mk
+
+# httplib needs Winsock on Windows
+ifdef ARCH_WIN
+  LDFLAGS += -lws2_32
+endif
+
 include $(RACK_DIR)/plugin.mk

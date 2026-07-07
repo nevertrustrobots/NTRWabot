@@ -7,10 +7,15 @@
 #include <chrono>
 #include <memory>
 #include <algorithm>
+#include <vector>
 #include <unordered_map>
 #include <cmath>
 #include <cstring>
-#include <sys/resource.h>
+#if defined(_WIN32)
+  #include <windows.h>
+#else
+  #include <sys/resource.h>
+#endif
 #include <patch.hpp>
 
 // ── JSON helpers ──────────────────────────────────────────────────────────────
@@ -669,6 +674,22 @@ struct NTRWabot : Module {
         return job->done.load();
     }
 
+    // Strip per-port voltage/voltages/peak fields from a module JSON blob.
+    // Relies on the fixed field order written by updateCache():
+    // ..."channels": N, "voltage": X, "voltages": [...], "peak": P, "connected": ...
+    static std::string slimModuleJson(std::string s) {
+        const std::string from = ", " + jStr("voltage") + ": ";
+        const std::string upto = ", " + jStr("connected") + ": ";
+        size_t pos = 0;
+        while ((pos = s.find(from, pos)) != std::string::npos) {
+            size_t end = s.find(upto, pos);
+            if (end == std::string::npos) break;
+            s.erase(pos, end - pos);
+            pos += upto.size();
+        }
+        return s;
+    }
+
     // ── HTTP routes ───────────────────────────────────────────────────────────
     void setupRoutes() {
         svr.Get("/status", [this](const httplib::Request&, httplib::Response& res) {
@@ -691,7 +712,10 @@ struct NTRWabot : Module {
                 if (moduleListJson[end] == '{') depth++;
                 else if (moduleListJson[end] == '}') { depth--; if (!depth) break; }
             }
-            res.set_content(moduleListJson.substr(start, end - start + 1), "application/json");
+            std::string body = moduleListJson.substr(start, end - start + 1);
+            if (r.has_param("slim") && r.get_param_value("slim") != "0")
+                body = slimModuleJson(body);
+            res.set_content(body, "application/json");
         });
         svr.Get("/cables",   [this](const httplib::Request&, httplib::Response& res){ std::unique_lock<std::mutex> lk(cacheMtx); res.set_content(cableListJson,"application/json"); });
         svr.Get("/graph",    [this](const httplib::Request&, httplib::Response& res){ std::unique_lock<std::mutex> lk(cacheMtx); res.set_content(graphJson,"application/json"); });
@@ -778,6 +802,258 @@ struct NTRWabot : Module {
             body += jStr("dominantHz")   + ": " + std::to_string(bestFreq) + ", ";
             body += jStr("dominantNote") + ": " + jStr(note) + ", ";
             body += jStr("spectrum")     + ": " + spec;
+            body += "}";
+            res.set_content(body, "application/json");
+        });
+
+        // ── GET /audio/{port}/analyze — full-band problem-frequency analysis ──
+        // Two spectral snapshots ~120 ms apart (temporal stability separates
+        // constant defects like hum/feedback from musical content).
+        // Goertzel spectrum 20 Hz – 20 kHz on a 1/12-octave log grid.
+        // Reports: issues[] summary, resonances (with stable flag), hum
+        // (narrowband + stability checked), feedback suspect, inharmonic
+        // high peaks (aliasing/artifacts), band levels, noise floor, DC offset.
+        // ?spectrum=1 appends the raw bins of the latest snapshot.
+        svr.Get(R"(/audio/(\d+)/analyze)", [this](const httplib::Request& r, httplib::Response& res){
+            int port = std::stoi(r.matches[1].str());
+            if (port < 0 || port >= 2) {
+                res.set_content("{\"error\": \"port must be 0 (L) or 1 (R)\"}", "application/json");
+                return;
+            }
+            float sr = sampleRate;
+
+            // 1/12-octave grid 20 Hz → min(20 kHz, 0.45*sr)
+            float fMax = std::min(20000.f, sr * 0.45f);
+            std::vector<float> freqs;
+            for (float f = 20.f; f <= fMax; f *= 1.0594631f)  // 2^(1/12)
+                freqs.push_back(f);
+            const int nb = (int)freqs.size();
+
+            static float win[AUDIO_BUF];
+            static bool winInit = false;
+            if (!winInit) {
+                for (int i = 0; i < AUDIO_BUF; i++)
+                    win[i] = 0.5f * (1.f - cosf(2.f * float(M_PI) * i / (AUDIO_BUF - 1)));
+                winInit = true;
+            }
+
+            struct Snap {
+                std::vector<float> wbuf;   // Hann-windowed, DC-removed
+                std::vector<float> dbs;    // per grid bin
+                float rms = 0.f, pk = 0.f;
+                double mean = 0.0;
+            };
+
+            // Goertzel magnitude in dB (0 dB = 5V sine amplitude)
+            auto magDb = [&](const Snap& sn, float f) -> float {
+                float w = 2.f * float(M_PI) * f / sr;
+                float coeff = 2.f * cosf(w);
+                float s1 = 0.f, s2 = 0.f;
+                for (int i = 0; i < AUDIO_BUF; i++) {
+                    float s0 = sn.wbuf[i] + coeff * s1 - s2;
+                    s2 = s1; s1 = s0;
+                }
+                float power = s1*s1 + s2*s2 - coeff*s1*s2;
+                if (power < 0.f) power = 0.f;
+                float amp = sqrtf(power) * (4.f / AUDIO_BUF) / 5.f;
+                return 20.f * log10f(amp + 1e-7f);
+            };
+
+            auto capture = [&]() -> Snap {
+                Snap sn;
+                float buf[AUDIO_BUF];
+                {
+                    int h = audioRing[port].head.load(std::memory_order_relaxed);
+                    for (int i = 0; i < AUDIO_BUF; i++)
+                        buf[i] = audioRing[port].data[(h - AUDIO_BUF + i + AUDIO_BUF) & (AUDIO_BUF - 1)];
+                }
+                for (int i = 0; i < AUDIO_BUF; i++) sn.mean += buf[i];
+                sn.mean /= AUDIO_BUF;
+                float sumSq = 0.f;
+                sn.wbuf.resize(AUDIO_BUF);
+                for (int i = 0; i < AUDIO_BUF; i++) {
+                    float v = buf[i] - (float)sn.mean;
+                    sumSq += v * v;
+                    float a = std::fabs(v);
+                    if (a > sn.pk) sn.pk = a;
+                    sn.wbuf[i] = v * win[i];
+                }
+                sn.rms = sqrtf(sumSq / AUDIO_BUF);
+                sn.dbs.resize(nb);
+                for (int i = 0; i < nb; i++) sn.dbs[i] = magDb(sn, freqs[i]);
+                return sn;
+            };
+
+            Snap A = capture();
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            Snap B = capture();
+
+            // Noise floor = median bin level of latest snapshot
+            std::vector<float> sorted = B.dbs;
+            std::sort(sorted.begin(), sorted.end());
+            float floorDb = sorted[nb / 2];
+
+            std::vector<std::string> issues;
+
+            // Resonance peaks in B: local maxima, >=8 dB prominence.
+            // stable = same level (±3 dB) in snapshot A → standing resonance,
+            // prime EQ-notch candidate; unstable = transient musical content.
+            struct Peak { float hz, db, prom; bool stable; };
+            std::vector<Peak> peaks;
+            for (int i = 2; i < nb - 2; i++) {
+                if (B.dbs[i] <= B.dbs[i-1] || B.dbs[i] < B.dbs[i+1]) continue;
+                float loc = 0.f; int cnt = 0;
+                for (int k = -6; k <= 6; k++) {
+                    if (k >= -1 && k <= 1) continue;
+                    int j = i + k;
+                    if (j < 0 || j >= nb) continue;
+                    loc += B.dbs[j]; cnt++;
+                }
+                loc /= std::max(cnt, 1);
+                float prom = B.dbs[i] - loc;
+                if (prom >= 8.f && B.dbs[i] > floorDb + 6.f && B.dbs[i] > -80.f) {
+                    bool stable = std::fabs(A.dbs[i] - B.dbs[i]) <= 3.f;
+                    peaks.push_back({freqs[i], B.dbs[i], prom, stable});
+                }
+            }
+            std::sort(peaks.begin(), peaks.end(),
+                      [](const Peak& a, const Peak& b){ return a.prom > b.prom; });
+            if (peaks.size() > 10) peaks.resize(10);
+
+            // Mains hum: per harmonic require level > floor+12 dB AND
+            // narrowband (>=6 dB above ±15% off-grid neighbors — rejects broad
+            // musical energy near the 50/60 Hz grid) AND stable across snapshots.
+            auto humSeries = [&](float f0, std::string& arr) -> bool {
+                int hits = 0;
+                arr = "[";
+                for (int k = 1; k <= 4; k++) {
+                    float f = f0 * k;
+                    float d  = magDb(B, f);
+                    float nbr = std::max(magDb(B, f * 0.85f), magDb(B, f * 1.15f));
+                    float narrow = d - nbr;
+                    bool stable = std::fabs(magDb(A, f) - d) < 4.f;
+                    bool hit = d > floorDb + 12.f && narrow >= 6.f && stable;
+                    if (hit) hits++;
+                    if (k > 1) arr += ",";
+                    arr += "{" + jStr("hz") + ": " + std::to_string((int)f)
+                         + ", " + jStr("db") + ": " + jNum(d)
+                         + ", " + jStr("narrowDb") + ": " + jNum(narrow)
+                         + ", " + jStr("stable") + ": " + (stable ? "true" : "false") + "}";
+                }
+                arr += "]";
+                return hits >= 2;  // fundamental-ish + at least one harmonic
+            };
+            std::string hum50, hum60;
+            bool has50 = humSeries(50.f, hum50);
+            bool has60 = humSeries(60.f, hum60);
+            if (has50) issues.push_back("hum_50");
+            if (has60) issues.push_back("hum_60");
+
+            // Feedback suspect: dominant stable-or-rising narrow peak at high level
+            std::string feedback = "null";
+            for (auto& p : peaks) {
+                if (p.prom < 18.f || p.db < -20.f) continue;
+                int bi = (int)roundf(12.f * log2f(p.hz / 20.f));
+                if (bi < 0 || bi >= nb) continue;
+                float rise = B.dbs[bi] - A.dbs[bi];
+                if (rise >= -1.f) {  // not decaying
+                    feedback = "{" + jStr("hz") + ": " + jNum(p.hz)
+                             + ", " + jStr("note") + ": " + jStr(freqToNote(p.hz))
+                             + ", " + jStr("db") + ": " + jNum(p.db)
+                             + ", " + jStr("riseDb") + ": " + jNum(rise) + "}";
+                    issues.push_back("feedback_suspect");
+                    break;
+                }
+            }
+
+            // Aliasing/artifact suspect: peaks >8 kHz not harmonically related
+            // to the strongest peak below 5 kHz (ratio far from an integer)
+            std::string inharm = "[";
+            {
+                float f0 = 0.f, best = -999.f;
+                for (auto& p : peaks)
+                    if (p.hz < 5000.f && p.db > best) { best = p.db; f0 = p.hz; }
+                bool first = true;
+                for (auto& p : peaks) {
+                    if (p.hz < 8000.f || f0 <= 0.f) continue;
+                    float ratio = p.hz / f0;
+                    float offInt = std::fabs(ratio - roundf(ratio));
+                    if (offInt > 0.07f && p.db > floorDb + 12.f) {
+                        if (!first) inharm += ", ";
+                        first = false;
+                        inharm += "{" + jStr("hz") + ": " + jNum(p.hz)
+                                + ", " + jStr("db") + ": " + jNum(p.db) + "}";
+                    }
+                }
+                if (!first) issues.push_back("aliasing_suspect");
+            }
+            inharm += "]";
+
+            // Band energies (avg dB per band)
+            auto bandDb = [&](float lo, float hi) -> float {
+                float sum = 0.f; int cnt = 0;
+                for (int i = 0; i < nb; i++)
+                    if (freqs[i] >= lo && freqs[i] < hi) { sum += B.dbs[i]; cnt++; }
+                return cnt ? sum / cnt : -140.f;
+            };
+            float rumbleDb = bandDb(20.f, 45.f),   bassDb = bandDb(45.f, 250.f);
+            float lowmidDb = bandDb(250.f, 800.f), midDb = bandDb(800.f, 2500.f);
+            float highmidDb = bandDb(2500.f, 5000.f);
+            float sibDb = bandDb(5000.f, 8000.f),  airDb = bandDb(8000.f, 16000.f);
+
+            if (std::fabs((float)B.mean) > 0.25f) issues.push_back("dc_offset");
+            if (rumbleDb > bassDb + 6.f && rumbleDb > -60.f) issues.push_back("rumble");
+            if (sibDb > midDb + 6.f && sibDb > -60.f) issues.push_back("sibilance");
+            if (B.rms < 1e-4f) issues.push_back("silence");
+
+            std::string issuesArr = "[";
+            for (size_t i = 0; i < issues.size(); i++) {
+                if (i) issuesArr += ", ";
+                issuesArr += jStr(issues[i]);
+            }
+            issuesArr += "]";
+
+            std::string body = "{";
+            body += jStr("port") + ": " + std::to_string(port) + ", ";
+            body += jStr("issues") + ": " + issuesArr + ", ";
+            body += jStr("rms") + ": " + jNum(B.rms) + ", ";
+            body += jStr("peak") + ": " + jNum(B.pk) + ", ";
+            body += jStr("dcOffset") + ": " + jNum((float)B.mean) + ", ";
+            body += jStr("noiseFloorDb") + ": " + jNum(floorDb) + ", ";
+            body += jStr("bandsDb") + ": {"
+                  + jStr("rumble_20_45") + ": " + jNum(rumbleDb) + ", "
+                  + jStr("bass_45_250") + ": " + jNum(bassDb) + ", "
+                  + jStr("lowmid_250_800") + ": " + jNum(lowmidDb) + ", "
+                  + jStr("mid_800_2500") + ": " + jNum(midDb) + ", "
+                  + jStr("highmid_2500_5000") + ": " + jNum(highmidDb) + ", "
+                  + jStr("sibilance_5000_8000") + ": " + jNum(sibDb) + ", "
+                  + jStr("air_8000_16000") + ": " + jNum(airDb) + "}, ";
+            body += jStr("hum") + ": {"
+                  + jStr("detected50") + ": " + (has50 ? "true" : "false") + ", "
+                  + jStr("detected60") + ": " + (has60 ? "true" : "false") + ", "
+                  + jStr("series50") + ": " + hum50 + ", "
+                  + jStr("series60") + ": " + hum60 + "}, ";
+            body += jStr("feedback") + ": " + feedback + ", ";
+            body += jStr("inharmonicHighPeaks") + ": " + inharm + ", ";
+            body += jStr("resonances") + ": [";
+            for (size_t i = 0; i < peaks.size(); i++) {
+                if (i) body += ", ";
+                body += "{" + jStr("hz") + ": " + jNum(peaks[i].hz)
+                      + ", " + jStr("note") + ": " + jStr(freqToNote(peaks[i].hz))
+                      + ", " + jStr("db") + ": " + jNum(peaks[i].db)
+                      + ", " + jStr("prominenceDb") + ": " + jNum(peaks[i].prom)
+                      + ", " + jStr("stable") + ": " + (peaks[i].stable ? "true" : "false") + "}";
+            }
+            body += "]";
+            if (r.has_param("spectrum") && r.get_param_value("spectrum") != "0") {
+                body += ", " + jStr("spectrum") + ": [";
+                for (int i = 0; i < nb; i++) {
+                    if (i) body += ",";
+                    body += "{" + jStr("hz") + ": " + std::to_string((int)roundf(freqs[i]))
+                          + "," + jStr("db") + ": " + jNum(B.dbs[i]) + "}";
+                }
+                body += "]";
+            }
             body += "}";
             res.set_content(body, "application/json");
         });
@@ -876,9 +1152,21 @@ struct NTRWabot : Module {
             { std::unique_lock<std::mutex> lk(cacheMtx);
               blockDur=cachedBlockDurationMs; blockFr=cachedBlockFrames;
               modCnt=cachedModuleCount; cableCnt=cachedCableCount; }
+#if defined(_WIN32)
+            double userSec = 0.0, sysSec = 0.0;
+            FILETIME ct, et, kt, ut;
+            if (GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut)) {
+                auto ft2sec = [](const FILETIME& ft) {
+                    ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+                    return (double)u.QuadPart / 1e7;  // 100ns units
+                };
+                userSec = ft2sec(ut); sysSec = ft2sec(kt);
+            }
+#else
             struct rusage ru; getrusage(RUSAGE_SELF, &ru);
             double userSec = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec/1e6;
             double sysSec  = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec/1e6;
+#endif
             std::string b = "{";
             b += jStr("sampleRate")+": "+std::to_string(sampleRate)+", ";
             b += jStr("blockFrames")+": "+std::to_string(blockFr)+", ";

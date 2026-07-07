@@ -7,3 +7,6 @@ plugin.so
 *.o
 *.d
 *.vcvplugin
+mcp_server/
+*.bak
+.DS_Store

@@ -1,10 +1,12 @@
 name: Build NTRWabot
 
-# Runs on version tags (e.g. v2.9.0) and manual dispatch
+# CI on every push/PR + release on version tags
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -90,7 +92,7 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: make RACK_DIR=$GITHUB_WORKSPACE/Rack-SDK -j$(nproc)
+        run: make RACK_DIR=$(cygpath -u "$GITHUB_WORKSPACE")/Rack-SDK -j$(nproc)
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -135,6 +137,24 @@ jobs:
           name: "Nevertrustrobots Wabot ${{ github.ref_name }}"
           draft: true
           generate_release_notes: true
+          body: |
+            ## Nevertrustrobots Wabot ${{ github.ref_name }}
+
+            VCV Rack module that opens an HTTP bridge on port 7777,
+            enabling Claude AI to read and control your patch in real time.
+
+            ### Installation
+            Download the `.vcvplugin` for your platform, place it in your Rack2 plugins folder and restart VCV Rack:
+            - **macOS:** `~/Documents/Rack2/plugins/`
+            - **Windows:** `%LOCALAPPDATA%\Rack2\plugins\`
+            - **Linux:** `~/.Rack2/plugins/`
+
+            ### MCP Server + Claude Skill (required to use with Claude)
+            The module alone starts the server. To connect it to Claude AI
+            you need the **MCP Server and the NTR_Wabot Skill** — available exclusively at:
+
+            **https://www.patreon.com/c/nevertrustrobots**
+
           files: artifacts/*.vcvplugin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
