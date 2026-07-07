@@ -28,6 +28,7 @@ include $(RACK_DIR)/arch.mk
 
 # httplib needs Winsock on Windows
 ifdef ARCH_WIN
+  FLAGS   += -D_WIN32_WINNT=0x0A00
   LDFLAGS += -lws2_32
 endif
 
