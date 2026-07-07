@@ -9,6 +9,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 env:
   RACK_SDK_VERSION: 2.6.6
   PLUGIN_SLUG: NTRWabot
