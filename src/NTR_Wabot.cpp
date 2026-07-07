@@ -1353,7 +1353,7 @@ struct NTRWabotWidget : ModuleWidget {
         drawSphere(args.vg, cx, mm2px(Vec(0.f,17.f)).y, mm2px(Vec(0.f,7.f)).y, on);
 
         std::shared_ptr<Font> font = APP->window->loadFont(
-            asset::plugin(pluginInstance,"res/fonts/NTR_Switzer-Semibold.ttf"));
+            asset::plugin(pluginInstance,"res/fonts/NTR_Inter-SemiBold.ttf"));
         if (!font) return;
         nvgFontFaceId(args.vg, font->handle);
         nvgTextAlign(args.vg, NVG_ALIGN_CENTER|NVG_ALIGN_MIDDLE);
