@@ -24,6 +24,9 @@ CFLAGS   +=
 CXXFLAGS +=
 LDFLAGS  +=
 
+DISTRIBUTABLES += res
+DISTRIBUTABLES += $(wildcard LICENSE*)
+
 include $(RACK_DIR)/arch.mk
 
 # httplib needs Winsock on Windows

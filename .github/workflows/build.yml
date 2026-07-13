@@ -62,12 +62,7 @@ jobs:
       - name: Package (macOS / Linux)
         if: runner.os != 'Windows'
         shell: bash
-        run: |
-          mkdir -p dist/${{ env.PLUGIN_SLUG }}
-          cp plugin.* dist/${{ env.PLUGIN_SLUG }}/
-          cp -R res   dist/${{ env.PLUGIN_SLUG }}/
-          cd dist
-          zip -r -9 ../${{ env.PLUGIN_SLUG }}-${{ matrix.platform }}.vcvplugin ${{ env.PLUGIN_SLUG }}/
+        run: make dist RACK_DIR=$RACK_DIR
 
       # ── Windows: MSYS2 + MinGW-w64 ─────────────────────────────────────────
 
@@ -81,6 +76,7 @@ jobs:
             base-devel
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-jq
+            mingw-w64-x86_64-zstd
             unzip
             curl
             zip
@@ -102,12 +98,7 @@ jobs:
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: |
-          mkdir -p dist/${{ env.PLUGIN_SLUG }}
-          cp plugin.* dist/${{ env.PLUGIN_SLUG }}/
-          cp -R res   dist/${{ env.PLUGIN_SLUG }}/
-          cd dist
-          zip -r -9 ../${{ env.PLUGIN_SLUG }}-${{ matrix.platform }}.vcvplugin ${{ env.PLUGIN_SLUG }}/
+        run: make dist RACK_DIR=$(cygpath -u "$GITHUB_WORKSPACE")/Rack-SDK
 
       # ── Upload artifact ─────────────────────────────────────────────────────
 
@@ -115,7 +106,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PLUGIN_SLUG }}-${{ matrix.platform }}
-          path: ${{ env.PLUGIN_SLUG }}-${{ matrix.platform }}.vcvplugin
+          path: dist/*.vcvplugin
           retention-days: 30
 
   # ── Create GitHub Release when triggered by a tag ──────────────────────────
