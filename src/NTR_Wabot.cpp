@@ -175,6 +175,25 @@ struct NTRWabot : Module {
     AudioRingBuf audioRing[2];    // 0 = L input, 1 = R input
     float        sampleRate = 44100.f;  // set in process(), read by HTTP
 
+    // ── Loudness / stereo meter ────────────────────────────────────────────────
+    // Audio thread accumulates into working sums (thread-local to process()),
+    // merges into published sums every 2048 samples via try_lock (never blocks).
+    // HTTP thread reads published sums under the mutex. Samples normalized to
+    // 10V = 0 dBFS. K-weighting: ITU BS.1770 biquads (48kHz coefficients —
+    // close enough at 44.1/96k for target-checking purposes).
+    struct LoudnessMeter {
+        // audio-thread working state
+        double z[2][4] = {};                 // biquad states per ch: hs1,hs2,hp1,hp2
+        double kSum[2] = {}, rawSum[2] = {}, sumLR = 0.0, peak[2] = {};
+        uint64_t n = 0;
+        int flushTimer = 0;
+        // published (mtx-protected)
+        double pKSum[2] = {}, pRawSum[2] = {}, pSumLR = 0.0, pPeak[2] = {};
+        uint64_t pN = 0;
+        std::mutex mtx;
+        std::atomic<bool> resetFlag{false};
+    } lm;
+
     // Patch cache — UI thread writes, HTTP thread reads
     std::vector<ModuleEntry> cache;
     std::string              moduleListJson    = "[]";
@@ -226,11 +245,64 @@ struct NTRWabot : Module {
         sampleRate = args.sampleRate;
 
         // Sample audio inputs into ring buffers (lock-free: aligned float writes are atomic on x86/ARM)
+        float ch[2];
         for (int j = 0; j < 2; j++) {
             float v = inputs[j].getVoltage();
+            ch[j] = v;
             int h = audioRing[j].head.load(std::memory_order_relaxed);
             audioRing[j].data[h & (AUDIO_BUF - 1)] = v;
             audioRing[j].head.store(h + 1, std::memory_order_relaxed);
+        }
+
+        // Loudness/stereo meter accumulation (normalized: 10V = 0 dBFS)
+        if (lm.resetFlag.load(std::memory_order_relaxed)) {
+            if (lm.mtx.try_lock()) {
+                for (int j = 0; j < 2; j++) {
+                    lm.kSum[j] = lm.rawSum[j] = lm.peak[j] = 0.0;
+                    lm.z[j][0] = lm.z[j][1] = lm.z[j][2] = lm.z[j][3] = 0.0;
+                    lm.pKSum[j] = lm.pRawSum[j] = lm.pPeak[j] = 0.0;
+                }
+                lm.sumLR = lm.pSumLR = 0.0; lm.n = lm.pN = 0; lm.flushTimer = 0;
+                lm.resetFlag.store(false, std::memory_order_relaxed);
+                lm.mtx.unlock();
+            }
+        } else {
+            // BS.1770 K-weighting biquads (48kHz coefficients)
+            static const double hsB0=1.53512485958697, hsB1=-2.69169618940638, hsB2=1.19839281085285,
+                                hsA1=-1.69065929318241, hsA2=0.73248077421585;
+            static const double hpB0=1.0, hpB1=-2.0, hpB2=1.0,
+                                hpA1=-1.99004745483398, hpA2=0.99007225036621;
+            double x[2];
+            for (int j = 0; j < 2; j++) {
+                double in = ch[j] * 0.1;                     // 10V → 1.0 full scale
+                double a  = std::fabs(in);
+                if (a > lm.peak[j]) lm.peak[j] = a;
+                lm.rawSum[j] += in * in;
+                // shelving stage (transposed direct form II)
+                double y1 = hsB0*in + lm.z[j][0];
+                lm.z[j][0] = hsB1*in - hsA1*y1 + lm.z[j][1];
+                lm.z[j][1] = hsB2*in - hsA2*y1;
+                // high-pass stage
+                double y2 = hpB0*y1 + lm.z[j][2];
+                lm.z[j][2] = hpB1*y1 - hpA1*y2 + lm.z[j][3];
+                lm.z[j][3] = hpB2*y1 - hpA2*y2;
+                lm.kSum[j] += y2 * y2;
+                x[j] = in;
+            }
+            lm.sumLR += x[0] * x[1];
+            lm.n++;
+            if (++lm.flushTimer >= 2048 && lm.mtx.try_lock()) {
+                for (int j = 0; j < 2; j++) {
+                    lm.pKSum[j] += lm.kSum[j]; lm.kSum[j] = 0.0;
+                    lm.pRawSum[j] += lm.rawSum[j]; lm.rawSum[j] = 0.0;
+                    if (lm.peak[j] > lm.pPeak[j]) lm.pPeak[j] = lm.peak[j];
+                    lm.peak[j] = 0.0;
+                }
+                lm.pSumLR += lm.sumLR; lm.sumLR = 0.0;
+                lm.pN += lm.n; lm.n = 0;
+                lm.flushTimer = 0;
+                lm.mtx.unlock();
+            }
         }
 
         bool on = serverRunning;
@@ -1056,6 +1128,59 @@ struct NTRWabot : Module {
             }
             body += "}";
             res.set_content(body, "application/json");
+        });
+
+        // ── GET /audio/loudness — integrated loudness + stereo image since reset ──
+        // Continuous meter fed by the Analyze L/R inputs. POST /audio/loudness/reset
+        // to start a fresh measurement window, let the patch play, then read.
+        svr.Get("/audio/loudness", [this](const httplib::Request&, httplib::Response& res){
+            double kSum[2], rawSum[2], peak[2], sumLR; uint64_t n;
+            {
+                std::unique_lock<std::mutex> lk(lm.mtx);
+                for (int j = 0; j < 2; j++) { kSum[j]=lm.pKSum[j]; rawSum[j]=lm.pRawSum[j]; peak[j]=lm.pPeak[j]; }
+                sumLR = lm.pSumLR; n = lm.pN;
+            }
+            if (n < 4800) {
+                res.set_content("{\"error\":\"not enough data — reset the meter, let the patch play a few seconds, then read again\"}",
+                                "application/json");
+                return;
+            }
+            auto db  = [](double x){ return 10.0 * log10(x + 1e-12); };
+            double seconds = n / (double)sampleRate;
+            // BS.1770: stereo integrated = sum of channel mean squares (K-weighted)
+            double lufs   = -0.691 + db((kSum[0] + kSum[1]) / n);
+            double lufsL  = -0.691 + db(kSum[0] / n);
+            double lufsR  = -0.691 + db(kSum[1] / n);
+            double rmsL   = db(rawSum[0] / n), rmsR = db(rawSum[1] / n);
+            double peakL  = 20.0 * log10(peak[0] + 1e-12), peakR = 20.0 * log10(peak[1] + 1e-12);
+            double corr   = sumLR / (sqrt(rawSum[0] * rawSum[1]) + 1e-12);
+            double balDb  = 0.5 * (db(rawSum[0]) - db(rawSum[1]));  // >0 = left louder
+            double midMS  = (rawSum[0] + 2.0*sumLR + rawSum[1]) / (4.0 * n);
+            double sideMS = (rawSum[0] - 2.0*sumLR + rawSum[1]) / (4.0 * n);
+            double sideMidDb = db(sideMS) - db(midMS);
+
+            std::string b = "{";
+            b += jStr("secondsMeasured") + ": " + jNum((float)seconds) + ", ";
+            b += jStr("lufsIntegrated") + ": " + jNum((float)lufs) + ", ";
+            b += jStr("left")  + ": {" + jStr("lufs") + ": " + jNum((float)lufsL) + ", "
+               + jStr("rmsDb") + ": " + jNum((float)rmsL) + ", "
+               + jStr("peakDb") + ": " + jNum((float)peakL) + ", "
+               + jStr("crestDb") + ": " + jNum((float)(peakL - rmsL)) + "}, ";
+            b += jStr("right") + ": {" + jStr("lufs") + ": " + jNum((float)lufsR) + ", "
+               + jStr("rmsDb") + ": " + jNum((float)rmsR) + ", "
+               + jStr("peakDb") + ": " + jNum((float)peakR) + ", "
+               + jStr("crestDb") + ": " + jNum((float)(peakR - rmsR)) + "}, ";
+            b += jStr("stereo") + ": {"
+               + jStr("correlation") + ": " + jNum((float)corr) + ", "
+               + jStr("balanceDb") + ": " + jNum((float)balDb) + ", "
+               + jStr("sideMidDb") + ": " + jNum((float)sideMidDb) + "}";
+            b += "}";
+            res.set_content(b, "application/json");
+        });
+
+        svr.Post("/audio/loudness/reset", [this](const httplib::Request&, httplib::Response& res){
+            lm.resetFlag.store(true, std::memory_order_relaxed);
+            res.set_content("{\"ok\":true}", "application/json");
         });
 
         svr.Get(R"(/modules/(\d+)/params/(\d+))",
