@@ -10,3 +10,4 @@ plugin.so
 mcp_server/
 *.bak
 .DS_Store
+tools/

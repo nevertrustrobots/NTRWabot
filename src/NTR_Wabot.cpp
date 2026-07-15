@@ -150,6 +150,32 @@ struct PatchSaveJob {
     std::string savedPath;
     std::atomic<bool> done{false}; bool success=false; std::string error;
 };
+struct BulkParamJob {
+    struct Change { int64_t moduleId; int paramId; float value; };
+    std::vector<Change> changes;
+    std::vector<int> failed;              // indices that could not be applied
+    std::atomic<bool> done{false}; bool success=false;
+};
+struct UndoJob {
+    std::atomic<bool> done{false}; bool success=false;
+    std::string label; std::string error;
+};
+
+// One reversible action. All fields UI-thread-owned; stack guarded by undoMtx
+// only for push/pop/size (HTTP thread reads labels).
+struct UndoAction {
+    enum Type { PARAM, PARAMS, CABLE_RECONNECT, CABLE_CLEAR, BYPASS, STATE, MOVE, DELETE_ADDED } type;
+    int64_t moduleId=-1; int paramId=-1; float oldValue=0.f;
+    std::vector<std::array<float,3>> paramOlds;           // PARAMS: not used (see paramList)
+    struct POld { int64_t m; int p; float v; };
+    std::vector<POld> paramList;                          // PARAMS
+    int64_t inModId=-1; int inPortId=-1;                  // CABLE_CLEAR target
+    std::vector<std::array<int64_t,4>> cables;            // CABLE_RECONNECT: out,outPort,in,inPort
+    bool oldBypassed=false;
+    std::string oldState;
+    float oldX=0.f, oldY=0.f;
+    std::string label;
+};
 struct ParamEntry {
     float value=0.f, minV=0.f, maxV=1.f, defaultV=0.f;
     std::string name, unit;
@@ -219,6 +245,13 @@ struct NTRWabot : Module {
     int    cachedBlockFrames = 0;
     int    cachedModuleCount = 0;
     int    cachedCableCount  = 0;
+
+    // Undo (stack owned by UI thread; mutex only guards container ops)
+    std::vector<UndoAction> undoStack; std::mutex undoMtx;
+    static const size_t UNDO_MAX = 32;
+    bool applyingUndo = false;   // suppress recording while undoing
+    std::queue<std::shared_ptr<UndoJob>>      undoQueue;      std::mutex undoQueueMtx;
+    std::queue<std::shared_ptr<BulkParamJob>> bulkParamQueue; std::mutex bulkParamQueueMtx;
 
     // Delete / Move job queues
     std::queue<std::shared_ptr<DeleteModuleJob>> deleteQueue; std::mutex deleteQueueMtx;
@@ -578,6 +611,13 @@ struct NTRWabot : Module {
     }
 
     // ── UI-thread: job processors ─────────────────────────────────────────────
+    void pushUndo(UndoAction a) {
+        if (applyingUndo) return;
+        std::unique_lock<std::mutex> lk(undoMtx);
+        undoStack.push_back(std::move(a));
+        if (undoStack.size() > UNDO_MAX) undoStack.erase(undoStack.begin());
+    }
+
     void processSetQueue() {
         std::shared_ptr<SetParamJob> job;
         { std::unique_lock<std::mutex> lk(setQueueMtx); if (!setQueue.empty()) { job=setQueue.front(); setQueue.pop(); } }
@@ -587,7 +627,11 @@ struct NTRWabot : Module {
             float v=job->value;
             ParamQuantity* pq=m->getParamQuantity(job->paramId);
             if (pq) v=rack::math::clamp(v,pq->getMinValue(),pq->getMaxValue());
+            UndoAction a; a.type=UndoAction::PARAM; a.moduleId=job->moduleId; a.paramId=job->paramId;
+            a.oldValue=APP->engine->getParamValue(m,job->paramId);
+            a.label="set param "+std::to_string(job->paramId)+" on module "+std::to_string(job->moduleId);
             APP->engine->setParamValue(m,job->paramId,v);
+            pushUndo(std::move(a));
             job->success=true;
         }
         job->done=true;
@@ -612,13 +656,32 @@ struct NTRWabot : Module {
                 if (!cw->isComplete()) {
                     APP->engine->removeCable(cw->releaseCable()); delete cw;
                     job->error="cable incomplete: port not found (outPort="+std::to_string(job->outPortId)+" inPort="+std::to_string(job->inPortId)+")";
-                } else { APP->scene->rack->addCable(cw); job->success=true; }
+                } else {
+                    APP->scene->rack->addCable(cw); job->success=true;
+                    UndoAction a; a.type=UndoAction::CABLE_CLEAR;
+                    a.inModId=job->inModId; a.inPortId=(int)job->inPortId;
+                    a.label="connect cable -> module "+std::to_string(job->inModId)+" port "+std::to_string(job->inPortId);
+                    pushUndo(std::move(a));
+                }
             } else { job->error="module not found"; }
         } else if (job->type==CableJob::REMOVE) {
             ModuleWidget* inW=APP->scene->rack->getModule(job->inModId);
             if (inW) {
                 PortWidget* inPort=inW->getInput((int)job->inPortId);
-                if (inPort) { APP->scene->rack->clearCablesOnPort(inPort); job->success=true; }
+                if (inPort) {
+                    UndoAction a; a.type=UndoAction::CABLE_RECONNECT;
+                    for (int64_t cid : APP->engine->getCableIds()) {
+                        engine::Cable* c = APP->engine->getCable(cid);
+                        if (c && c->inputModule && c->inputModule->id==job->inModId
+                            && c->inputId==(int)job->inPortId && c->outputModule)
+                            a.cables.push_back({c->outputModule->id,(int64_t)c->outputId,
+                                                c->inputModule->id,(int64_t)c->inputId});
+                    }
+                    a.label="disconnect input port "+std::to_string(job->inPortId)+" on module "+std::to_string(job->inModId);
+                    APP->scene->rack->clearCablesOnPort(inPort);
+                    if (!a.cables.empty()) pushUndo(std::move(a));
+                    job->success=true;
+                }
                 else { job->error="port not found"; }
             } else { job->error="module not found"; }
         } else { // REMOVE_OUTPUT — disconnect all cables from one output port
@@ -630,11 +693,18 @@ struct NTRWabot : Module {
                     && c->outputId==(int)job->outPortId && c->inputModule)
                     targets.push_back({c->inputModule->id, c->inputId});
             }
+            UndoAction a; a.type=UndoAction::CABLE_RECONNECT;
+            for (auto& t : targets)
+                a.cables.push_back({job->outModId, job->outPortId, t.first, (int64_t)t.second});
             for (auto& t : targets) {
                 ModuleWidget* inW = APP->scene->rack->getModule(t.first);
                 if (!inW) continue;
                 PortWidget* inPort = inW->getInput(t.second);
                 if (inPort) APP->scene->rack->clearCablesOnPort(inPort);
+            }
+            if (!a.cables.empty()) {
+                a.label="disconnect all cables from output "+std::to_string(job->outPortId)+" on module "+std::to_string(job->outModId);
+                pushUndo(std::move(a));
             }
             job->success=true;
         }
@@ -660,6 +730,9 @@ struct NTRWabot : Module {
                 math::Vec target=cnt>0?math::Vec(sumX/cnt,sumY/cnt):math::Vec(0.f,0.f);
                 APP->scene->rack->setModulePosNearest(mw,target);
                 job->newId=m->id; job->success=true;
+                UndoAction a; a.type=UndoAction::DELETE_ADDED; a.moduleId=m->id;
+                a.label="add module "+job->pluginSlug+"/"+job->modelSlug;
+                pushUndo(std::move(a));
             } catch (std::exception& e) { job->error=e.what(); }
         }
         job->done=true;
@@ -680,14 +753,121 @@ struct NTRWabot : Module {
         job->success=true; job->done=true;
     }
 
+    void processBulkParamQueue() {
+        std::shared_ptr<BulkParamJob> job;
+        { std::unique_lock<std::mutex> lk(bulkParamQueueMtx); if (!bulkParamQueue.empty()) { job=bulkParamQueue.front(); bulkParamQueue.pop(); } }
+        if (!job) return;
+        UndoAction a; a.type=UndoAction::PARAMS;
+        for (size_t i = 0; i < job->changes.size(); i++) {
+            auto& ch = job->changes[i];
+            engine::Module* m = APP->engine->getModule(ch.moduleId);
+            if (!m || ch.paramId < 0 || ch.paramId >= (int)m->params.size()) {
+                job->failed.push_back((int)i); continue;
+            }
+            float v = ch.value;
+            ParamQuantity* pq = m->getParamQuantity(ch.paramId);
+            if (pq) v = rack::math::clamp(v, pq->getMinValue(), pq->getMaxValue());
+            a.paramList.push_back({ch.moduleId, ch.paramId, APP->engine->getParamValue(m, ch.paramId)});
+            APP->engine->setParamValue(m, ch.paramId, v);
+        }
+        if (!a.paramList.empty()) {
+            a.label="bulk set "+std::to_string(a.paramList.size())+" parameters";
+            pushUndo(std::move(a));
+        }
+        job->success=true; job->done=true;
+    }
+
+    void processUndoQueue() {
+        std::shared_ptr<UndoJob> job;
+        { std::unique_lock<std::mutex> lk(undoQueueMtx); if (!undoQueue.empty()) { job=undoQueue.front(); undoQueue.pop(); } }
+        if (!job) return;
+        UndoAction a;
+        { std::unique_lock<std::mutex> lk(undoMtx);
+          if (undoStack.empty()) { job->error="nothing to undo"; job->done=true; return; }
+          a = std::move(undoStack.back()); undoStack.pop_back(); }
+        applyingUndo = true;
+        switch (a.type) {
+            case UndoAction::PARAM: {
+                engine::Module* m = APP->engine->getModule(a.moduleId);
+                if (m) { APP->engine->setParamValue(m, a.paramId, a.oldValue); job->success=true; }
+                else job->error="module gone";
+                break; }
+            case UndoAction::PARAMS: {
+                job->success=true;
+                for (auto& po : a.paramList) {
+                    engine::Module* m = APP->engine->getModule(po.m);
+                    if (m) APP->engine->setParamValue(m, po.p, po.v);
+                }
+                break; }
+            case UndoAction::CABLE_CLEAR: {
+                ModuleWidget* inW = APP->scene->rack->getModule(a.inModId);
+                PortWidget* inPort = inW ? inW->getInput(a.inPortId) : NULL;
+                if (inPort) { APP->scene->rack->clearCablesOnPort(inPort); job->success=true; }
+                else job->error="port gone";
+                break; }
+            case UndoAction::CABLE_RECONNECT: {
+                job->success=true;
+                for (auto& cb : a.cables) {
+                    engine::Module* src=APP->engine->getModule(cb[0]);
+                    engine::Module* dst=APP->engine->getModule(cb[2]);
+                    ModuleWidget* outW=APP->scene->rack->getModule(cb[0]);
+                    ModuleWidget* inW =APP->scene->rack->getModule(cb[2]);
+                    if (!src||!dst||!outW||!inW) continue;
+                    engine::Cable* c=new engine::Cable;
+                    c->outputModule=src; c->outputId=(int)cb[1];
+                    c->inputModule=dst;  c->inputId=(int)cb[3];
+                    APP->engine->addCable(c);
+                    CableWidget* cw=new CableWidget;
+                    cw->setCable(c);
+                    if (!cw->isComplete()) { APP->engine->removeCable(cw->releaseCable()); delete cw; }
+                    else APP->scene->rack->addCable(cw);
+                }
+                break; }
+            case UndoAction::BYPASS: {
+                engine::Module* m = APP->engine->getModule(a.moduleId);
+                if (m) { APP->engine->bypassModule(m, a.oldBypassed); job->success=true; }
+                else job->error="module gone";
+                break; }
+            case UndoAction::STATE: {
+                engine::Module* m = APP->engine->getModule(a.moduleId);
+                if (!m) { job->error="module gone"; break; }
+                json_error_t jerr;
+                json_t* rootJ = json_loads(a.oldState.c_str(), 0, &jerr);
+                if (rootJ) { m->fromJson(rootJ); json_decref(rootJ); job->success=true; }
+                else job->error="stored state unparsable";
+                break; }
+            case UndoAction::MOVE: {
+                ModuleWidget* mw = APP->scene->rack->getModule(a.moduleId);
+                if (mw) { APP->scene->rack->setModulePosNearest(mw, math::Vec(a.oldX, a.oldY)); job->success=true; }
+                else job->error="module gone";
+                break; }
+            case UndoAction::DELETE_ADDED: {
+                ModuleWidget* mw = APP->scene->rack->getModule(a.moduleId);
+                if (mw) {
+                    engine::Module* m = mw->module;
+                    APP->scene->rack->removeModule(mw);
+                    APP->engine->removeModule(m);
+                    job->success=true;
+                } else job->error="module gone";
+                break; }
+        }
+        applyingUndo = false;
+        job->label = a.label;
+        job->done = true;
+    }
+
     void processMoveQueue() {
         std::shared_ptr<MoveModuleJob> job;
         { std::unique_lock<std::mutex> lk(moveQueueMtx); if (!moveQueue.empty()) { job=moveQueue.front(); moveQueue.pop(); } }
         if (!job) return;
         ModuleWidget* mw = APP->scene->rack->getModule(job->moduleId);
         if (!mw) { job->error="module not found"; job->done=true; return; }
+        UndoAction a; a.type=UndoAction::MOVE; a.moduleId=job->moduleId;
+        a.oldX=mw->box.pos.x; a.oldY=mw->box.pos.y;
+        a.label="move module "+std::to_string(job->moduleId);
         // RACK_GRID_WIDTH = 15px per HP
         APP->scene->rack->setModulePosNearest(mw, math::Vec(job->hp * RACK_GRID_WIDTH, 0.f));
+        pushUndo(std::move(a));
         job->success=true; job->done=true;
     }
 
@@ -697,7 +877,11 @@ struct NTRWabot : Module {
         if (!job) return;
         engine::Module* m = APP->engine->getModule(job->moduleId);
         if (!m) { job->error="module not found"; job->done=true; return; }
+        UndoAction a; a.type=UndoAction::BYPASS; a.moduleId=job->moduleId;
+        a.oldBypassed=m->isBypassed();
+        a.label=std::string(job->bypassed?"bypass":"un-bypass")+" module "+std::to_string(job->moduleId);
         APP->engine->bypassModule(m, job->bypassed);
+        pushUndo(std::move(a));
         job->success=true; job->done=true;
     }
 
@@ -718,7 +902,12 @@ struct NTRWabot : Module {
             json_error_t jerr;
             json_t* rootJ = json_loads(job->stateJson.c_str(), 0, &jerr);
             if (!rootJ) { job->error = std::string("JSON parse: ") + jerr.text; job->done=true; return; }
+            UndoAction a; a.type=UndoAction::STATE; a.moduleId=job->moduleId;
+            { json_t* oldJ = m->toJson();
+              if (oldJ) { char* str=json_dumps(oldJ,JSON_COMPACT); if (str){ a.oldState=str; free(str);} json_decref(oldJ); } }
+            a.label="restore state on module "+std::to_string(job->moduleId);
             m->fromJson(rootJ);
+            if (!a.oldState.empty()) pushUndo(std::move(a));
             json_decref(rootJ);
         }
         job->success=true; job->done=true;
@@ -1272,6 +1461,101 @@ struct NTRWabot : Module {
             else res.set_content("{\"error\":"+jStr(job->error)+"}","application/json");
         });
 
+        // ── POST /params/bulk — set many parameters in one call ──────────────
+        // Body: {"changes":[{"moduleId":..,"paramId":..,"value":..}, ...]}
+        svr.Post("/params/bulk", [this](const httplib::Request& r, httplib::Response& res){
+            json_error_t jerr;
+            json_t* root = json_loads(r.body.c_str(), 0, &jerr);
+            json_t* arr = root ? json_object_get(root, "changes") : NULL;
+            if (!arr || !json_is_array(arr)) {
+                if (root) json_decref(root);
+                res.set_content("{\"error\":\"body must be {changes:[{moduleId,paramId,value}]}\"}","application/json");
+                return;
+            }
+            auto job = std::make_shared<BulkParamJob>();
+            size_t idx; json_t* el;
+            json_array_foreach(arr, idx, el) {
+                json_t* jm = json_object_get(el, "moduleId");
+                json_t* jp = json_object_get(el, "paramId");
+                json_t* jv = json_object_get(el, "value");
+                if (!jm || !jp || !jv) { job->failed.push_back((int)idx); continue; }
+                job->changes.push_back({(int64_t)json_integer_value(jm),
+                                        (int)json_integer_value(jp),
+                                        (float)json_number_value(jv)});
+            }
+            json_decref(root);
+            { std::unique_lock<std::mutex> lk(bulkParamQueueMtx); bulkParamQueue.push(job); }
+            if (!waitDone(job, 2000)) { res.set_content("{\"error\":\"timeout\"}","application/json"); return; }
+            std::string b = "{" + jStr("ok") + ": true, "
+                          + jStr("applied") + ": " + std::to_string(job->changes.size() - job->failed.size())
+                          + ", " + jStr("failedIndices") + ": [";
+            for (size_t i = 0; i < job->failed.size(); i++) {
+                if (i) b += ",";
+                b += std::to_string(job->failed[i]);
+            }
+            b += "]}";
+            res.set_content(b, "application/json");
+        });
+
+        // ── POST /undo — revert the most recent write operation ──────────────
+        svr.Post("/undo", [this](const httplib::Request&, httplib::Response& res){
+            auto job = std::make_shared<UndoJob>();
+            { std::unique_lock<std::mutex> lk(undoQueueMtx); undoQueue.push(job); }
+            if (!waitDone(job, 2000)) { res.set_content("{\"error\":\"timeout\"}","application/json"); return; }
+            if (!job->success) { res.set_content("{"+jStr("error")+": "+jStr(job->error)+"}","application/json"); return; }
+            res.set_content("{"+jStr("ok")+": true, "+jStr("undone")+": "+jStr(job->label)+"}","application/json");
+        });
+
+        // ── GET /undo/status — pending undo stack (newest first) ──────────────
+        svr.Get("/undo/status", [this](const httplib::Request&, httplib::Response& res){
+            std::string b = "{" + jStr("actions") + ": [";
+            { std::unique_lock<std::mutex> lk(undoMtx);
+              for (size_t i = 0; i < undoStack.size(); i++) {
+                  if (i) b += ", ";
+                  b += jStr(undoStack[undoStack.size()-1-i].label);
+              } }
+            b += "]}";
+            res.set_content(b, "application/json");
+        });
+
+        // ── GET /audio/measure?seconds=N — reset meter, measure, return ──────
+        // Server-side version of reset -> wait -> read: one call, correct timing.
+        svr.Get("/audio/measure", [this](const httplib::Request& r, httplib::Response& res){
+            int seconds = 15;
+            if (r.has_param("seconds")) seconds = std::stoi(r.get_param_value("seconds"));
+            seconds = std::max(1, std::min(60, seconds));
+            lm.resetFlag.store(true, std::memory_order_relaxed);
+            // wait for audio thread to consume the reset (or engine paused)
+            for (int i = 0; i < 100 && lm.resetFlag.load(std::memory_order_relaxed); i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (lm.resetFlag.load(std::memory_order_relaxed)) {
+                res.set_content("{\"error\":\"audio engine not running — is VCV paused?\"}","application/json");
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(seconds));
+            double kSum[2], rawSum[2], peak[2], sumLR; uint64_t n;
+            { std::unique_lock<std::mutex> lk(lm.mtx);
+              for (int j = 0; j < 2; j++) { kSum[j]=lm.pKSum[j]; rawSum[j]=lm.pRawSum[j]; peak[j]=lm.pPeak[j]; }
+              sumLR = lm.pSumLR; n = lm.pN; }
+            if (n < 4800) { res.set_content("{\"error\":\"no audio data during measurement window\"}","application/json"); return; }
+            auto db = [](double x){ return 10.0 * log10(x + 1e-12); };
+            double lufs  = -0.691 + db((kSum[0] + kSum[1]) / n);
+            double rmsL  = db(rawSum[0] / n), rmsR = db(rawSum[1] / n);
+            double peakL = 20.0*log10(peak[0]+1e-12), peakR = 20.0*log10(peak[1]+1e-12);
+            double corr  = sumLR / (sqrt(rawSum[0]*rawSum[1]) + 1e-12);
+            double balDb = 0.5 * (db(rawSum[0]) - db(rawSum[1]));
+            double midMS  = (rawSum[0] + 2.0*sumLR + rawSum[1]) / (4.0*n);
+            double sideMS = (rawSum[0] - 2.0*sumLR + rawSum[1]) / (4.0*n);
+            std::string b = "{";
+            b += jStr("secondsMeasured") + ": " + jNum((float)(n/(double)sampleRate)) + ", ";
+            b += jStr("lufsIntegrated") + ": " + jNum((float)lufs) + ", ";
+            b += jStr("left")  + ": {" + jStr("rmsDb") + ": " + jNum((float)rmsL) + ", " + jStr("peakDb") + ": " + jNum((float)peakL) + ", " + jStr("crestDb") + ": " + jNum((float)(peakL-rmsL)) + "}, ";
+            b += jStr("right") + ": {" + jStr("rmsDb") + ": " + jNum((float)rmsR) + ", " + jStr("peakDb") + ": " + jNum((float)peakR) + ", " + jStr("crestDb") + ": " + jNum((float)(peakR-rmsR)) + "}, ";
+            b += jStr("stereo") + ": {" + jStr("correlation") + ": " + jNum((float)corr) + ", " + jStr("balanceDb") + ": " + jNum((float)balDb) + ", " + jStr("sideMidDb") + ": " + jNum((float)(db(sideMS)-db(midMS))) + "}";
+            b += "}";
+            res.set_content(b, "application/json");
+        });
+
         svr.Get("/perf", [this](const httplib::Request&, httplib::Response& res){
             double blockDur; int blockFr, modCnt, cableCnt;
             { std::unique_lock<std::mutex> lk(cacheMtx);
@@ -1448,6 +1732,8 @@ struct NTRWabotWidget : ModuleWidget {
         m->processBypassQueue();
         m->processStateQueue();
         m->processPatchSaveQueue();
+        m->processBulkParamQueue();
+        m->processUndoQueue();
     }
 
     NTRWabotWidget(NTRWabot* module) {
