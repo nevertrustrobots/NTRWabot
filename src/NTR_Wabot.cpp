@@ -80,6 +80,17 @@ static bool parseBoolField(const std::string& body, const std::string& key) {
     return p + 4 <= body.size() && body.substr(p, 4) == "true";
 }
 
+// ── Config from environment ───────────────────────────────────────────────────
+static int wabotPort() {
+    const char* e = getenv("NTR_WABOT_PORT");
+    if (e) { int p = atoi(e); if (p > 0 && p < 65536) return p; }
+    return 7777;
+}
+static std::string wabotToken() {
+    const char* e = getenv("NTR_WABOT_TOKEN");
+    return e ? std::string(e) : std::string();
+}
+
 // ── Note name from frequency ──────────────────────────────────────────────────
 static std::string freqToNote(float freq) {
     if (freq <= 0.f) return "?";
@@ -953,8 +964,21 @@ struct NTRWabot : Module {
 
     // ── HTTP routes ───────────────────────────────────────────────────────────
     void setupRoutes() {
+        // Optional shared-secret auth: set NTR_WABOT_TOKEN in the environment
+        // (both for VCV Rack and the MCP server) to require it on every request.
+        static const std::string token = wabotToken();
+        if (!token.empty()) {
+            svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res){
+                if (req.get_header_value("X-Wabot-Token") != token) {
+                    res.status = 401;
+                    res.set_content("{\"error\":\"invalid or missing X-Wabot-Token\"}", "application/json");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                return httplib::Server::HandlerResponse::Unhandled;
+            });
+        }
         svr.Get("/status", [this](const httplib::Request&, httplib::Response& res) {
-            std::string b = "{"+jStr("running")+": "+(serverRunning?"true":"false")+", "+jStr("port")+": 7777, "+jStr("version")+": "+jStr("2.9.0")+"}";
+            std::string b = "{"+jStr("running")+": "+(serverRunning?"true":"false")+", "+jStr("port")+": "+std::to_string(wabotPort())+", "+jStr("version")+": "+jStr("2.10.0")+"}";
             res.set_content(b,"application/json");
         });
 
@@ -1674,7 +1698,7 @@ struct NTRWabot : Module {
     void startServer() {
         if (serverRunning) return;
         serverRunning=true;
-        serverThread=std::thread([this](){ svr.listen("127.0.0.1",7777); serverRunning=false; });
+        serverThread=std::thread([this](){ svr.listen("127.0.0.1", wabotPort()); serverRunning=false; });
         serverThread.detach();
     }
     void stopServer() { if (!serverRunning) return; svr.stop(); serverRunning=false; }
